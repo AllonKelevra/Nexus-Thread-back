@@ -141,6 +141,11 @@ class Settings(BaseSettings):
     REMNAWAVE_AUTO_SYNC_TIMES: str = '03:00'
     CABINET_REMNA_SUB_CONFIG: str | None = None  # UUID конфига страницы подписки из RemnaWave
 
+    MTPROTO_API_URL: str | None = None
+    MTPROTO_PUBLIC_HOST: str = 'cloud.nexus-thread.com'
+    MTPROTO_MAX_TCP_CONNS: int = 3
+    MTPROTO_EXPIRATION_RFC3339: str = '2099-12-31T23:59:59Z'
+
     # RemnaWave incoming webhooks (real-time event delivery from backend)
     REMNAWAVE_WEBHOOK_ENABLED: bool = False
     REMNAWAVE_WEBHOOK_PATH: str = '/remnawave-webhook'
