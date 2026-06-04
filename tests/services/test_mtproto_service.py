@@ -6,6 +6,10 @@ import pytest
 from app.services.mtproto_service import MtprotoService
 
 
+def _tls_secret(domain: str, secret: str = 'a' * 32) -> str:
+    return f'ee{secret}{domain.encode().hex()}'
+
+
 def _response(status_code: int, data) -> httpx.Response:
     request = httpx.Request('GET', 'https://telemt.example/v1/users')
     return httpx.Response(status_code, request=request, json={'ok': True, 'data': data})
@@ -35,7 +39,12 @@ class FakeClient:
         self.posts.append(json)
         user = {
             'username': json['username'],
-            'links': {'tls': ['tg://proxy?server=old.example&port=443&secret=abc']},
+            'links': {
+                'tls': [
+                    f'tg://proxy?server=cloud.nexus-thread.com&port=443&secret={_tls_secret("tech.example")}',
+                    f'tg://proxy?server=cloud.nexus-thread.com&port=443&secret={_tls_secret("cloud.nexus-thread.com")}',
+                ]
+            },
         }
         self.users.append(user)
         return _response(200, {'user': user, 'secret': 'not-logged'})
@@ -50,15 +59,19 @@ def test_build_username_matches_required_format_and_limit():
 
 
 def test_find_link_prefers_tls():
+    cloud_secret = _tls_secret('cloud.nexus-thread.com')
     user = {
         'links': {
             'classic': ['tg://proxy?server=classic'],
             'secure': ['tg://proxy?server=secure'],
-            'tls': ['tg://proxy?server=tls'],
+            'tls': [
+                f'tg://proxy?server=cloud.nexus-thread.com&secret={_tls_secret("tech.example")}',
+                f'tg://proxy?server=cloud.nexus-thread.com&secret={cloud_secret}',
+            ],
         }
     }
 
-    assert MtprotoService._find_link(user) == 'tg://proxy?server=tls'
+    assert MtprotoService._find_link(user) == f'tg://proxy?server=cloud.nexus-thread.com&secret={cloud_secret}'
 
 
 @pytest.mark.asyncio
@@ -75,7 +88,7 @@ async def test_ensure_proxy_link_creates_user_with_required_limits(monkeypatch):
 
     link = await MtprotoService().ensure_proxy_link(12345, 'test_user')
 
-    assert link == 'tg://proxy?server=cloud.nexus-thread.com&port=443&secret=abc'
+    assert MtprotoService._tls_domain_from_link(link) == 'cloud.nexus-thread.com'
     assert client.posts == [
         {
             'username': 'test_user_12345',
@@ -89,7 +102,11 @@ async def test_ensure_proxy_link_creates_user_with_required_limits(monkeypatch):
 async def test_ensure_proxy_link_reuses_existing_user_by_telegram_suffix(monkeypatch):
     existing = {
         'username': 'old_name_12345',
-        'links': {'secure': ['tg://proxy?server=old.example&port=443&secret=abc']},
+        'links': {
+            'tls': [
+                f'tg://proxy?server=cloud.nexus-thread.com&port=443&secret={_tls_secret("cloud.nexus-thread.com")}'
+            ]
+        },
     }
     client = FakeClient([existing])
     monkeypatch.setattr('app.services.mtproto_service.settings.MTPROTO_API_URL', 'https://telemt.example')
@@ -100,5 +117,5 @@ async def test_ensure_proxy_link_reuses_existing_user_by_telegram_suffix(monkeyp
         SimpleNamespace(telegram_id=12345, username='new_name')
     )
 
-    assert link == 'tg://proxy?server=cloud.nexus-thread.com&port=443&secret=abc'
+    assert MtprotoService._tls_domain_from_link(link) == 'cloud.nexus-thread.com'
     assert client.posts == []

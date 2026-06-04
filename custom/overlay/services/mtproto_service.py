@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 import structlog
@@ -39,12 +39,42 @@ class MtprotoService:
         return payload['data']
 
     @staticmethod
-    def _find_link(user: dict[str, Any]) -> str | None:
+    def _tls_domain_from_link(link: str) -> str | None:
+        secret = parse_qs(urlsplit(link).query).get('secret', [''])[0]
+        if not secret.startswith('ee') or len(secret) <= 34:
+            return None
+
+        try:
+            return bytes.fromhex(secret[34:]).decode().lower()
+        except (UnicodeDecodeError, ValueError):
+            return None
+
+    @classmethod
+    def _find_link(cls, user: dict[str, Any]) -> str | None:
         links = user.get('links')
         if not isinstance(links, dict):
             return None
 
-        for mode in ('tls', 'secure', 'classic'):
+        tls_links = links.get('tls')
+        if isinstance(tls_links, list):
+            public_host = settings.MTPROTO_PUBLIC_HOST.strip().lower()
+            if public_host:
+                matching_link = next(
+                    (
+                        link
+                        for link in tls_links
+                        if isinstance(link, str) and cls._tls_domain_from_link(link) == public_host
+                    ),
+                    None,
+                )
+                if matching_link:
+                    return matching_link
+
+            link = next((value for value in tls_links if isinstance(value, str) and value), None)
+            if link:
+                return link
+
+        for mode in ('secure', 'classic'):
             values = links.get(mode)
             if isinstance(values, list):
                 link = next((value for value in values if isinstance(value, str) and value), None)
@@ -58,17 +88,6 @@ class MtprotoService:
                     return item['link']
 
         return None
-
-    @staticmethod
-    def _use_public_host(link: str) -> str:
-        public_host = settings.MTPROTO_PUBLIC_HOST.strip()
-        if not public_host:
-            return link
-
-        parsed = urlsplit(link)
-        query = parse_qsl(parsed.query, keep_blank_values=True)
-        replaced = [(key, public_host if key == 'server' else value) for key, value in query]
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(replaced), parsed.fragment))
 
     async def _get_user(self, client: httpx.AsyncClient, username: str) -> dict[str, Any] | None:
         encoded_username = quote(username, safe='')
@@ -138,7 +157,7 @@ class MtprotoService:
                 if not link:
                     raise MtprotoServiceError('Telemt API did not return a proxy link')
 
-                return self._use_public_host(link)
+                return link
         except (httpx.HTTPError, ValueError) as error:
             raise MtprotoServiceError('Telemt API request failed') from error
 
