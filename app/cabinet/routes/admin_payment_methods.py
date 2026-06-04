@@ -3,7 +3,7 @@
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,13 +28,19 @@ from app.services.payment_method_config_service import (
     update_config,
     update_sort_order,
 )
+from app.services.permission_service import PERMISSION_REGISTRY, PermissionService
 
-from ..dependencies import get_cabinet_db, require_permission
+from ..dependencies import get_cabinet_db, get_current_cabinet_user, require_permission
+from ..ip_utils import get_client_ip
 
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix='/admin/payment-methods', tags=['Cabinet Admin Payment Methods'])
+
+# Keep the overlay compatible with images that predate the dedicated permission.
+if 'secrets' not in PERMISSION_REGISTRY.setdefault('payment_methods', []):
+    PERMISSION_REGISTRY['payment_methods'].append('secrets')
 
 
 # ============ Schemas ============
@@ -127,6 +133,49 @@ class SecretUpdateRequest(BaseModel):
 
 
 # ============ Helpers ============
+
+
+async def require_payment_secret_permission(
+    request: Request,
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> User:
+    """Check secret-management permission without persisting the request body."""
+    try:
+        client_ip = get_client_ip(request)
+    except HTTPException:
+        client_ip = 'unknown'
+
+    allowed, reason = await PermissionService.check_permission(
+        db,
+        user,
+        'payment_methods:secrets',
+        ip_address=client_ip,
+    )
+    await PermissionService.log_action(
+        db,
+        user_id=user.id,
+        action='payment_methods:secrets',
+        resource_type='payment_methods',
+        status='success' if allowed else 'denied',
+        ip_address=client_ip,
+        user_agent=request.headers.get('user-agent', ''),
+        request_method=request.method,
+        request_path=str(request.url.path),
+        details={
+            'method': request.method,
+            'path': str(request.url.path),
+            'sensitive_body_redacted': True,
+            **({} if allowed else {'reason': reason}),
+        },
+    )
+    await db.commit()
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f'Permission denied: {reason}',
+        )
+    return user
 
 
 def _enrich_config(config, defaults: dict, provider_configured: bool | None = None) -> PaymentMethodConfigResponse:
@@ -327,7 +376,7 @@ async def update_payment_provider_secret(
     method_id: str,
     secret_key: str,
     request: SecretUpdateRequest,
-    admin: User = Depends(require_permission('payment_methods:secrets')),
+    admin: User = Depends(require_payment_secret_permission),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Replace a write-only provider secret."""
@@ -343,7 +392,7 @@ async def update_payment_provider_secret(
 async def clear_payment_provider_secret(
     method_id: str,
     secret_key: str,
-    admin: User = Depends(require_permission('payment_methods:secrets')),
+    admin: User = Depends(require_payment_secret_permission),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Clear a provider secret without returning its value."""

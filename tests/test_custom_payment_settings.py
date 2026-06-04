@@ -1,7 +1,14 @@
+import inspect
+
 import pytest
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
+from app.cabinet.routes.admin_payment_methods import (
+    clear_payment_provider_secret,
+    require_payment_secret_permission,
+    update_payment_provider_secret,
+)
 from app.services.custom_payment_settings_service import (
     CustomPaymentSecretError,
     calculate_credit_amount,
@@ -9,6 +16,7 @@ from app.services.custom_payment_settings_service import (
     encrypt_secret,
     validate_provider_config,
 )
+from app.services.permission_service import get_all_permissions
 
 
 def test_manual_config_sanitizes_rich_text_and_rejects_duplicate_banks():
@@ -72,3 +80,16 @@ def test_secret_crypto_fails_closed_without_or_with_wrong_master_key(monkeypatch
     monkeypatch.setenv('CUSTOM_PAYMENT_SETTINGS_MASTER_KEY', Fernet.generate_key().decode('ascii'))
     with pytest.raises(CustomPaymentSecretError):
         decrypt_secret(ciphertext)
+
+
+def test_secret_routes_use_redacted_audit_dependency():
+    assert 'payment_methods:secrets' in get_all_permissions()
+    assert 'request.body' not in inspect.getsource(require_payment_secret_permission)
+    assert (
+        inspect.signature(update_payment_provider_secret).parameters['admin'].default.dependency
+        is require_payment_secret_permission
+    )
+    assert (
+        inspect.signature(clear_payment_provider_secret).parameters['admin'].default.dependency
+        is require_payment_secret_permission
+    )

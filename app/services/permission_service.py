@@ -62,7 +62,7 @@ PERMISSION_REGISTRY: dict[str, list[str]] = {
     'partners': ['read', 'edit', 'approve', 'revoke', 'settings'],
     'withdrawals': ['read', 'approve', 'reject'],
     'payments': ['read', 'edit', 'export'],
-    'payment_methods': ['read', 'edit'],
+    'payment_methods': ['read', 'edit', 'secrets'],
     'servers': ['read', 'edit'],
     'remnawave': ['read', 'sync', 'manage'],
     'traffic': ['read', 'export'],
