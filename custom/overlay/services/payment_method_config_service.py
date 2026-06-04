@@ -7,6 +7,11 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database.models import PaymentMethodConfig, PromoGroup
+from app.services.custom_payment_settings_service import (
+    CUSTOM_METHODS,
+    get_public_provider_config,
+    is_provider_configured,
+)
 
 
 logger = structlog.get_logger(__name__)
@@ -242,19 +247,14 @@ def _get_method_defaults() -> dict:
         },
         'manual': {
             'default_display_name': settings.get_manual_display_name(),
-            'is_configured': settings.is_manual_enabled(),
+            'is_configured': False,
             'default_min': 10000,
             'default_max': 5000000,
-            'available_sub_options': [
-                {'id': 'yandex', 'name': 'Яндекс (рекомендуется)'},
-                {'id': 'alfa', 'name': 'Альфа Банк'},
-                {'id': 'tbank', 'name': 'Т-Банк'},
-                {'id': 'sber', 'name': 'Сбербанк'},
-            ],
+            'available_sub_options': None,
         },
         'yoomoney_donate': {
             'default_display_name': 'YooMoney',
-            'is_configured': settings.is_manual_enabled(),
+            'is_configured': False,
             'default_min': 10000,
             'default_max': 5000000,
             'available_sub_options': None,
@@ -514,8 +514,13 @@ async def get_enabled_methods_for_user(
         if not config.is_enabled:
             continue
 
-        # Skip if provider not configured in env
-        if not method_def.get('is_configured', False):
+        # Custom providers are configured at runtime; all others keep their env readiness checks.
+        configured = (
+            await is_provider_configured(db, method_id)
+            if method_id in CUSTOM_METHODS
+            else method_def.get('is_configured', False)
+        )
+        if not configured:
             continue
 
         # Apply user_type_filter
@@ -569,11 +574,20 @@ async def get_enabled_methods_for_user(
         # Build options (filter by sub_options config)
         options = None
         available_sub_options = method_def.get('available_sub_options')
-        if available_sub_options and config.sub_options:
+        if method_id == 'manual':
+            provider_config = await get_public_provider_config(db, method_id)
+            available_sub_options = [
+                {
+                    'id': bank['id'],
+                    'name': f"{bank['label']}{' (рекомендуется)' if bank['recommended'] else ''}",
+                }
+                for bank in provider_config['banks']
+            ]
+        if available_sub_options:
             enabled_options = []
             for opt in available_sub_options:
                 opt_id = opt['id']
-                if config.sub_options.get(opt_id, True):
+                if not config.sub_options or config.sub_options.get(opt_id, True):
                     enabled_options.append(opt)
             if enabled_options:
                 options = enabled_options

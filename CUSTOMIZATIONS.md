@@ -18,6 +18,8 @@ This fork keeps the production Nexus Thread custom backend layer for Bedolaga Bo
 - User flow creates a ticket with `sbp_meta:{ticket_id}` in Redis.
 - Admin can confirm from the bot callback `sbp_approve:{ticket_id}` or cabinet endpoint.
 - Confirm is idempotent: balance is credited once, ticket gets an admin message, then closes.
+- Phone, enabled/sorted banks, description, quick amounts, and sanitized rich-text instructions
+  are stored in `SystemSetting` under `CUSTOM_PAYMENT_MANUAL_CONFIG`.
 
 Cabinet API dependencies:
 
@@ -29,10 +31,12 @@ Cabinet API dependencies:
 
 - Payment method id: `yoomoney_donate`.
 - Display name: `YooMoney`.
-- Description: `Оплата картой, комиссия 3%, автоматическое пополнение`.
-- User enters the gross amount; credited amount is gross minus 3%.
+- Wallet, fee in basis points, description, and quick amounts are stored in
+  `CUSTOM_PAYMENT_YOOMONEY_CONFIG`.
 - Cabinet creates a YooMoney payment form label and redirects through a browser form submit.
-- YooMoney HTTP notification validates `YOOMONEY_NOTIFICATION_SECRET` and credits balance automatically.
+- YooMoney HTTP notification secret is encrypted in
+  `CUSTOM_PAYMENT_YOOMONEY_NOTIFICATION_SECRET_ENC`; `YOOMONEY_NOTIFICATION_SECRET` is a temporary
+  read-only environment fallback.
 
 Cabinet API dependencies:
 
@@ -59,9 +63,11 @@ Production `docker-compose.yml` mounts:
 
 - `custom/overlay/config.py` -> `/app/app/config.py`
 - `custom/overlay/services/payment_method_config_service.py` -> `/app/app/services/payment_method_config_service.py`
+- `custom/overlay/services/custom_payment_settings_service.py` -> `/app/app/services/custom_payment_settings_service.py`
 - `custom/overlay/services/sbp_manual_service.py` -> `/app/app/services/sbp_manual_service.py`
 - `custom/overlay/services/yoomoney_manual_service.py` -> `/app/app/services/yoomoney_manual_service.py`
 - `custom/overlay/cabinet/routes/balance.py` -> `/app/app/cabinet/routes/balance.py`
+- `custom/overlay/cabinet/routes/admin_payment_methods.py` -> `/app/app/cabinet/routes/admin_payment_methods.py`
 - `custom/overlay/cabinet/routes/branding.py` -> `/app/app/cabinet/routes/branding.py`
 - `custom/overlay/states.py` -> `/app/app/states.py`
 - `custom/overlay/handlers/balance/sbp_manual.py` -> `/app/app/handlers/balance/sbp_manual.py`
@@ -78,7 +84,10 @@ Required production keys are configured in `/opt/bedolaga-bot/.env`:
 - `CABINET_URL`
 - `CABINET_JWT_SECRET`
 - `CABINET_ALLOWED_ORIGINS`
-- `YOOMONEY_NOTIFICATION_SECRET`
+- `CUSTOM_PAYMENT_SETTINGS_MASTER_KEY`
+
+`YOOMONEY_NOTIFICATION_SECRET` may be present only during migration. Remove it after the encrypted
+secret is configured through the cabinet.
 
 Values must not be committed.
 

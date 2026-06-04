@@ -18,6 +18,14 @@ from app.database.crud.saved_payment_method import (
 )
 from app.database.crud.user import get_user_by_id
 from app.database.models import PaymentMethod, Transaction, User
+from app.services.custom_payment_settings_service import (
+    CUSTOM_METHODS,
+    fee_percent,
+    get_enabled_bank,
+    get_provider_config,
+    get_public_provider_config,
+    is_provider_configured,
+)
 from app.services.payment_method_config_service import get_enabled_methods_for_user
 from app.services.payment_service import PaymentService
 from app.services.payment_verification_service import (
@@ -205,10 +213,8 @@ async def get_payment_methods(
             options = formatted_options or None
 
         _method_description = None
-        if method_id == 'manual':
-            _method_description = 'Без комиссии, требуется подтверждение платежа'
-        elif method_id == 'yoomoney_donate':
-            _method_description = 'Оплата картой, комиссия 3%, автоматическое пополнение'
+        if method_id in CUSTOM_METHODS:
+            _method_description = (await get_public_provider_config(db, method_id))['description']
         methods.append(
             PaymentMethodResponse(
                 id=method_id,
@@ -223,6 +229,21 @@ async def get_payment_methods(
         )
 
     return methods
+
+
+@router.get('/custom-payment-config/{method_id}', status_code=200)
+async def get_custom_payment_config(
+    method_id: str,
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Return only safe runtime fields for an available custom payment method."""
+    if method_id not in CUSTOM_METHODS or not await is_provider_configured(db, method_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Custom payment method is not available')
+    methods = await get_payment_methods(user=user, db=db)
+    if not any(method.id == method_id and method.is_available for method in methods):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Custom payment method is not available')
+    return await get_public_provider_config(db, method_id)
 
 
 @router.post('/stars-invoice', response_model=StarsInvoiceResponse)
@@ -1015,23 +1036,20 @@ async def create_topup(
                 )
 
         elif request.payment_method == 'manual':
-            if not settings.MANUAL_PAYMENT_ENABLED:
+            if not await is_provider_configured(db, 'manual'):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail='Manual SBP payment method is not available',
                 )
 
-            import json as _json, secrets as _secrets
+            import json as _json
+            import secrets as _secrets
             from urllib.parse import quote as _quote
+
             from app.utils.cache import cache as _cache
 
-            bank_names = {
-                'yandex': 'Яндекс (рекомендуется)',
-                'alfa': 'Альфа Банк',
-                'tbank': 'Т-Банк',
-                'sber': 'Сбербанк',
-            }
-            bank_display = bank_names.get(request.payment_option or '', request.payment_option or 'Не указан')
+            bank_config = await get_enabled_bank(db, request.payment_option or '')
+            bank_display = bank_config['label']
 
             _token = _secrets.token_urlsafe(32)
             _pending = {
@@ -1753,6 +1771,7 @@ async def create_yoomoney_auto_payment_from_cabinet(
 
     try:
         return await create_yoomoney_auto_payment(
+            db=db,
             user=user,
             amount_kopeks=request.amount_kopeks,
             success_url=f'{settings.CABINET_URL.rstrip("/")}/balance',
@@ -1791,6 +1810,7 @@ async def yoomoney_notification(
 async def confirm_sbp_payment(token: str, db: AsyncSession = Depends(get_cabinet_db)):
     """Confirm manual SBP payment — token-based auth, no JWT required."""
     import json as _json
+
     from app.services.sbp_manual_service import create_sbp_ticket
     from app.utils.cache import cache as _cache
 
@@ -1900,6 +1920,7 @@ async def admin_confirm_yoomoney_payment(
 async def get_ticket_actions(
     ticket_id: int,
     user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Return available actions for a ticket (e.g., SBP confirm button)."""
     if not settings.is_admin(
@@ -1935,10 +1956,14 @@ async def get_ticket_actions(
             yoomoney_status = 'pending'
             has_yoomoney_confirm = True
 
+    yoomoney_config = await get_provider_config(db, 'yoomoney_donate')
+    current_fee_percent = float(fee_percent(yoomoney_config['fee_basis_points']))
     return {
         'has_sbp_confirm': has_sbp_confirm,
         'status': sbp_status,
         'has_yoomoney_confirm': has_yoomoney_confirm,
         'yoomoney_status': yoomoney_status,
-        'yoomoney_fee_percent': yoomoney_meta.get('fee_percent', 3) if yoomoney_meta else 3,
+        'yoomoney_fee_percent': yoomoney_meta.get('fee_percent', current_fee_percent)
+        if yoomoney_meta
+        else current_fee_percent,
     }
