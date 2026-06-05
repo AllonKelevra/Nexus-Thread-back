@@ -121,12 +121,32 @@ class MtprotoService:
             None,
         )
 
+    @staticmethod
+    def _limits_payload() -> dict[str, int]:
+        return {
+            'max_unique_ips': settings.MTPROTO_MAX_UNIQUE_IPS,
+            'max_tcp_conns': settings.MTPROTO_MAX_TCP_CONNS,
+        }
+
+    @classmethod
+    def _limits_need_update(cls, user: dict[str, Any]) -> bool:
+        return any(user.get(key) != value for key, value in cls._limits_payload().items())
+
+    async def _patch_user_limits(self, client: httpx.AsyncClient, username: str) -> dict[str, Any] | None:
+        encoded_username = quote(username, safe='')
+        response = await client.patch(f'v1/users/{encoded_username}', json=self._limits_payload())
+        response.raise_for_status()
+        data = self._unwrap_data(response)
+        patched_user = data.get('user') if isinstance(data, dict) else None
+        return patched_user if isinstance(patched_user, dict) else await self._get_user(client, username)
+
     async def ensure_proxy_link(self, telegram_id: int | None, username: str | None) -> str | None:
         api_url = (settings.MTPROTO_API_URL or '').rstrip('/') + '/'
         if not api_url or telegram_id is None:
             return None
 
         desired_username = self.build_username(username, telegram_id)
+        created_user = False
 
         try:
             async with httpx.AsyncClient(base_url=api_url, timeout=self._timeout) as client:
@@ -139,7 +159,7 @@ class MtprotoService:
                         'v1/users',
                         json={
                             'username': desired_username,
-                            'max_tcp_conns': settings.MTPROTO_MAX_TCP_CONNS,
+                            **self._limits_payload(),
                             'expiration_rfc3339': settings.MTPROTO_EXPIRATION_RFC3339,
                         },
                     )
@@ -149,9 +169,15 @@ class MtprotoService:
                         response.raise_for_status()
                         data = self._unwrap_data(response)
                         user = data.get('user') if isinstance(data, dict) else None
+                        created_user = True
 
                 if not isinstance(user, dict):
                     raise MtprotoServiceError('Telemt API did not return a user')
+
+                if not created_user and self._limits_need_update(user):
+                    patched_user = await self._patch_user_limits(client, user['username'])
+                    if isinstance(patched_user, dict):
+                        user = patched_user
 
                 link = self._find_link(user)
                 if not link:

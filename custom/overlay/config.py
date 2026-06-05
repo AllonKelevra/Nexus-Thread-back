@@ -143,7 +143,8 @@ class Settings(BaseSettings):
 
     MTPROTO_API_URL: str | None = None
     MTPROTO_PUBLIC_HOST: str = 'cloud.nexus-thread.com'
-    MTPROTO_MAX_TCP_CONNS: int = 3
+    MTPROTO_MAX_UNIQUE_IPS: int = 3
+    MTPROTO_MAX_TCP_CONNS: int = 50
     MTPROTO_EXPIRATION_RFC3339: str = '2099-12-31T23:59:59Z'
 
     # RemnaWave incoming webhooks (real-time event delivery from backend)
