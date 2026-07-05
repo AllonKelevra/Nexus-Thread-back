@@ -2372,6 +2372,34 @@ def _get_payment_method_display_name(card, language: str = DEFAULT_LANGUAGE) -> 
     return method_name
 
 
+def _apply_payment_name_overrides(keyboard: list[list[InlineKeyboardButton]]) -> None:
+    """Replace payment-method button labels with cabinet-set display names."""
+    from app.services.payment_method_config_service import get_display_name_override
+
+    for row in keyboard:
+        for idx, button in enumerate(row):
+            data = button.callback_data or ''
+            if data.startswith('topup_amount|'):
+                parts = data.split('|')
+                method = parts[1] if len(parts) > 1 else ''
+            elif data.startswith('topup_'):
+                method = data[len('topup_') :]
+            else:
+                continue
+            override = get_display_name_override(method) if method else None
+            if override:
+                row[idx] = button.model_copy(update={'text': override})
+
+
+def _coerce_tg_user_id(telegram_id: str | int | None) -> int | None:
+    """Приводит telegram_id к положительному int или возвращает None."""
+    try:
+        numeric_id = int(telegram_id)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return numeric_id if numeric_id > 0 else None
+
+
 def get_saved_cards_keyboard(cards: list, language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
     texts = get_texts(language)
     keyboard = []
@@ -3616,6 +3644,92 @@ def get_admin_ticket_view_keyboard(
         )
 
     keyboard.append([InlineKeyboardButton(text=texts.BACK, callback_data='admin_tickets')])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def get_ticket_notification_keyboard(
+    ticket_id: int,
+    *,
+    user_id: int | None = None,
+    telegram_id: str | int | None = None,
+    username: str | None = None,
+    is_closed: bool = False,
+    is_user_blocked: bool = False,
+    is_admin: bool = False,
+    fsm_enabled: bool = True,
+    cabinet_button: InlineKeyboardButton | None = None,
+    language: str = DEFAULT_LANGUAGE,
+) -> InlineKeyboardMarkup:
+    texts = get_texts(language)
+    keyboard: list[list[InlineKeyboardButton]] = []
+
+    if cabinet_button is not None:
+        keyboard.append([cabinet_button])
+
+    url_row: list[InlineKeyboardButton] = []
+    if username:
+        safe_username = username.lstrip('@')
+        url_row.append(InlineKeyboardButton(text='✉ ЛС', url=f'tg://resolve?domain={safe_username}'))
+    if (tg_id := _coerce_tg_user_id(telegram_id)) is not None:
+        url_row.append(InlineKeyboardButton(text='👤 Профиль', url=f'tg://user?id={tg_id}'))
+    if url_row:
+        keyboard.append(url_row)
+
+    if is_admin and user_id:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text='👤 К пользователю',
+                    callback_data=f'admin_user_manage_{user_id}_from_ticket_{ticket_id}',
+                )
+            ]
+        )
+
+    if not is_closed and fsm_enabled:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('REPLY_TO_TICKET', '💬 Ответить'),
+                    callback_data=f'admin_reply_ticket_{ticket_id}',
+                )
+            ]
+        )
+
+    if not is_closed:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('CLOSE_TICKET', '🔒 Закрыть тикет'),
+                    callback_data=f'admin_close_ticket_{ticket_id}',
+                )
+            ]
+        )
+
+    if is_user_blocked:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('UNBLOCK', '✅ Разблокировать'),
+                    callback_data=f'admin_unblock_user_ticket_{ticket_id}',
+                )
+            ]
+        )
+    else:
+        block_row = [
+            InlineKeyboardButton(
+                text=texts.t('BLOCK_FOREVER', '🚫 Заблокировать'),
+                callback_data=f'admin_block_user_perm_ticket_{ticket_id}',
+            )
+        ]
+        if fsm_enabled:
+            block_row.append(
+                InlineKeyboardButton(
+                    text=texts.t('BLOCK_BY_TIME', '⏳ Блок по времени'),
+                    callback_data=f'admin_block_user_ticket_{ticket_id}',
+                )
+            )
+        keyboard.append(block_row)
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
