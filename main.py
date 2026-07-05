@@ -154,6 +154,9 @@ async def main():
         ]
     )
 
+    for insecure_default_warning in settings.collect_insecure_default_warnings():
+        logger.warning('⚠️ Insecure configuration default', detail=insecure_default_warning)
+
     async with timeline.stage('Подготовка локализаций', '🗂️', success_message='Шаблоны локализаций готовы') as stage:
         try:
             ensure_locale_templates()
@@ -269,10 +272,16 @@ async def main():
         ) as stage:
             try:
                 from app.database.database import AsyncSessionLocal
-                from app.services.payment_method_config_service import ensure_payment_method_configs
+                from app.services.payment_method_config_service import (
+                    ensure_payment_method_configs,
+                    refresh_display_name_overrides,
+                )
 
                 async with AsyncSessionLocal() as db:
                     await ensure_payment_method_configs(db)
+                    # Warm the display-name override cache so bot keyboards show
+                    # cabinet-configured method names (matches the cabinet).
+                    await refresh_display_name_overrides(db)
             except Exception as error:
                 stage.warning(f'Не удалось инициализировать платёжные методы: {error}')
                 logger.error('❌ Не удалось инициализировать платёжные методы', error=error)
@@ -655,8 +664,13 @@ async def main():
                 interval_minutes = daily_subscription_service.get_check_interval_minutes()
                 stage.log(f'Интервал проверки: {interval_minutes} мин')
             else:
-                daily_subscription_task = None
-                stage.skip('Суточные подписки отключены настройками')
+                # Суточные тарифы выключены, но сброс истёкших докупок трафика нужен
+                # любой установке, продающей пакеты ГБ: без него истёкший пакет роняет
+                # лимит мимо защиты от ухода в минус (#630055). Запускаем только его.
+                daily_subscription_task = asyncio.create_task(
+                    daily_subscription_service.start_traffic_reset_monitoring()
+                )
+                stage.log('Суточные тарифы выключены — запущен только сброс докупок трафика')
 
         async with timeline.stage(
             'Сервис проверки версий',
@@ -789,10 +803,17 @@ async def main():
                 if daily_subscription_task and daily_subscription_task.done():
                     exception = daily_subscription_task.exception()
                     if exception:
-                        logger.error('Сервис суточных подписок завершился с ошибкой', error=exception)
                         if daily_subscription_service.is_enabled():
+                            logger.error('Сервис суточных подписок завершился с ошибкой', error=exception)
                             logger.info('🔄 Перезапуск сервиса суточных подписок...')
                             daily_subscription_task = asyncio.create_task(daily_subscription_service.start_monitoring())
+                        else:
+                            # Суточные выключены — крутился только сброс докупок трафика (#630055).
+                            logger.error('Цикл сброса докупок трафика завершился с ошибкой', error=exception)
+                            logger.info('🔄 Перезапуск сброса докупок трафика...')
+                            daily_subscription_task = asyncio.create_task(
+                                daily_subscription_service.start_traffic_reset_monitoring()
+                            )
 
                 if auto_verification_active and not auto_payment_verification_service.is_running():
                     logger.warning('Сервис автопроверки пополнений остановился, пробуем перезапустить...')

@@ -1379,12 +1379,12 @@ async def update_user_subscription(
         if tariff.allowed_squads:
             subscription.connected_squads = tariff.allowed_squads
 
-        # Convert trial subscription to paid when switching to a non-trial tariff
-        if subscription.is_trial and not tariff.is_trial_available:
-            subscription.is_trial = False
-            if subscription.end_date and subscription.end_date > datetime.now(UTC):
-                subscription.status = SubscriptionStatus.ACTIVE.value
-            logger.info('Converted trial subscription to paid', user_id=user_id, tariff_name=tariff.name)
+        # NB: changing the tariff is a *relabel*, not a purchase — we deliberately
+        # do NOT flip is_trial here. Bug #629889: flipping a 1-day trial to
+        # is_trial=False left a phantom "paid" subscription that, once its trial
+        # day expired, got picked up by try_auto_extend_expired_after_topup (which
+        # only renews is_trial=False subs) and granted a full ~30-day tariff period.
+        # A trial stays a trial across a tariff change and expires normally.
 
         # Сбрасываем докупленный трафик при смене тарифа
         from sqlalchemy import delete as sql_delete
@@ -1489,6 +1489,29 @@ async def update_user_subscription(
         return UpdateSubscriptionResponse(
             success=True,
             message='Subscription cancelled',
+            subscription=await _build_subscription_info_async(db, subscription),
+        )
+
+    if request.action == 'reset':
+        # Полностью обнулить подписку «как будто пользователь её не оформлял»: снять
+        # наспамленные дни, обнулить трафик/сквады, пометить DISABLED и ОТКЛЮЧИТЬ в
+        # панели RemnaWave (не удаляя). Пользователь и его тикеты сохраняются —
+        # дальше юзер сам покупает тариф с нуля и выбирает срок.
+        from app.services.subscription_service import reset_subscription_with_panel
+
+        result = await reset_subscription_with_panel(db, user, subscription)
+
+        logger.info(
+            'Admin reset subscription for user',
+            admin_id=admin.id,
+            user_id=user_id,
+            subscription_id=subscription.id,
+            panel_disabled=result.get('panel_disabled'),
+        )
+
+        return UpdateSubscriptionResponse(
+            success=True,
+            message='Subscription reset',
             subscription=await _build_subscription_info_async(db, subscription),
         )
 
@@ -2564,7 +2587,6 @@ async def reset_user_trial(
 
     Actions:
     - Delete current subscription if exists
-    - Reset has_used_trial flag to False
     - User can now activate a new trial
     """
     user = await get_user_by_id(db, user_id)
@@ -2598,28 +2620,14 @@ async def reset_user_trial(
                     user_id=user_id,
                 )
             else:
-                # Deactivate in Remnawave panel first
-                from app.services.subscription_service import SubscriptionService
+                # Снос триала — общий код с ботовым bulk-сбросом: удаляет панель-юзера
+                # ПЕРВЫМ (race-safe относительно синк-воскрешения), затем строки в БД и
+                # чистит устаревший single-tariff remnawave_uuid.
+                from app.database.crud.subscription import wipe_trial_subscriptions
 
-                subscription_service = SubscriptionService()
-                for sub in subs_to_delete:
-                    _sub_uuid = sub.remnawave_uuid if settings.is_multi_tariff_enabled() else user.remnawave_uuid
-                    if _sub_uuid:
-                        try:
-                            await subscription_service.disable_remnawave_user(_sub_uuid)
-                        except Exception as e:
-                            logger.warning('Failed to disable Remnawave during trial reset', error=e)
+                wiped = await wipe_trial_subscriptions(db, subs_to_delete)
+                subscription_deleted = wiped > 0
 
-                # Delete only target subscriptions
-                from sqlalchemy import delete
-
-                for sub in subs_to_delete:
-                    await db.execute(delete(SubscriptionServer).where(SubscriptionServer.subscription_id == sub.id))
-                    await db.execute(delete(Subscription).where(Subscription.id == sub.id))
-                subscription_deleted = True
-
-    # Reset trial flag
-    user.has_used_trial = False
     user.updated_at = datetime.now(UTC)
 
     await db.commit()
@@ -3154,11 +3162,37 @@ async def sync_user_from_panel(
                     # Specific subscription requested — use its UUID directly
                     panel_user = await api.get_user_by_uuid(selected_sub.remnawave_uuid)
                 elif selected_sub and not selected_sub.remnawave_uuid:
-                    # Specific subscription requested but not yet linked to panel — cannot sync
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail='This subscription is not linked to the panel yet. Sync to panel first.',
-                    )
+                    # The subscription lost its panel UUID (e.g. a spurious user.deleted
+                    # webhook wiped it). Re-link it to its live panel user by
+                    # telegram_id/email — but only UNAMBIGUOUSLY: choose a panel user that
+                    # is NOT already linked to another of this user's subscriptions, so we
+                    # never bind two subs to the same panel user (telegram_id is one-to-many
+                    # in multi-tariff). This is what makes the panel->bot repair work after
+                    # the sibling-expiry corruption.
+                    linked_uuids = {s.remnawave_uuid for s in from_subs if s.id != selected_sub.id and s.remnawave_uuid}
+                    candidates = []
+                    if user.telegram_id:
+                        candidates = list(await api.get_user_by_telegram_id(user.telegram_id) or [])
+                    if not candidates and user.email:
+                        candidates = list(await api.get_user_by_email(user.email) or [])
+                    orphans = [pu for pu in candidates if pu.uuid not in linked_uuids]
+                    if len(orphans) == 1:
+                        panel_user = orphans[0]
+                        changes['remnawave_uuid'] = {'old': None, 'new': panel_user.uuid}
+                        selected_sub.remnawave_uuid = panel_user.uuid
+                    elif len(orphans) > 1:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=(
+                                'Multiple panel users match this account; cannot safely re-link '
+                                'this subscription. Resolve manually.'
+                            ),
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail='This subscription is not linked to the panel and no matching panel user was found.',
+                        )
                 else:
                     # No specific subscription — iterate all subscription UUIDs
                     sub_uuids = [s.remnawave_uuid for s in from_subs if s.remnawave_uuid]
@@ -3186,14 +3220,21 @@ async def sync_user_from_panel(
                     errors=['No user found in Remnawave panel by UUID, telegram_id, or email'],
                 )
 
-            # Build panel info
+            # Build panel info. active_internal_squads is a list[dict] (see the
+            # diagnostic in get_user_sync_status / auth.py); the previous .uuid/str
+            # checks matched nothing, so panel squads were never extracted and the
+            # repair could not restore connected_squads. Handle dict (real), str and
+            # object forms defensively.
             active_squads = []
-            if hasattr(panel_user, 'active_internal_squads') and panel_user.active_internal_squads:
-                for squad in panel_user.active_internal_squads:
-                    if hasattr(squad, 'uuid'):
-                        active_squads.append(squad.uuid)
-                    elif isinstance(squad, str):
-                        active_squads.append(squad)
+            for squad in getattr(panel_user, 'active_internal_squads', None) or []:
+                if isinstance(squad, dict):
+                    squad_uuid = squad.get('uuid')
+                elif isinstance(squad, str):
+                    squad_uuid = squad
+                else:
+                    squad_uuid = getattr(squad, 'uuid', None)
+                if squad_uuid:
+                    active_squads.append(squad_uuid)
 
             panel_info = PanelUserInfo(
                 uuid=panel_user.uuid,

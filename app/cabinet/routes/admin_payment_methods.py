@@ -3,44 +3,28 @@
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import User
-from app.services.custom_payment_settings_service import (
-    CUSTOM_METHODS,
-    YOOMONEY_SECRET_NAME,
-    SecretStatus,
-    delete_secret,
-    get_provider_config,
-    get_secret_status,
-    is_provider_configured,
-    save_provider_config,
-    set_secret,
-    validate_provider_config,
-)
 from app.services.payment_method_config_service import (
+    DEFAULT_QUICK_AMOUNTS,
     _get_method_defaults,
     get_all_configs,
     get_all_promo_groups,
     get_config_by_method_id,
+    normalize_quick_amounts,
     update_config,
     update_sort_order,
 )
-from app.services.permission_service import PERMISSION_REGISTRY, PermissionService
 
-from ..dependencies import get_cabinet_db, get_current_cabinet_user, require_permission
-from ..ip_utils import get_client_ip
+from ..dependencies import get_cabinet_db, require_permission
 
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix='/admin/payment-methods', tags=['Cabinet Admin Payment Methods'])
-
-# Keep the overlay compatible with images that predate the dedicated permission.
-if 'secrets' not in PERMISSION_REGISTRY.setdefault('payment_methods', []):
-    PERMISSION_REGISTRY['payment_methods'].append('secrets')
 
 
 # ============ Schemas ============
@@ -57,8 +41,11 @@ class PaymentMethodConfigResponse(BaseModel):
     is_enabled: bool
     display_name: str | None = None
     default_display_name: str
+    description: str | None = None
     sub_options: dict | None = None
     available_sub_options: list[SubOptionInfo] | None = None
+    quick_amounts: list[int] | None = None
+    default_quick_amounts: list[int] = Field(default_factory=lambda: list(DEFAULT_QUICK_AMOUNTS))
     min_amount_kopeks: int | None = None
     max_amount_kopeks: int | None = None
     default_min_amount_kopeks: int
@@ -96,12 +83,22 @@ class PaymentMethodConfigUpdateRequest(BaseModel):
                 raise ValueError('sub_options keys must be strings of at most 50 characters')
         return v
 
+    quick_amounts: list[int] | None = None
+    reset_quick_amounts: bool = False
+
+    @field_validator('quick_amounts')
+    @classmethod
+    def validate_quick_amounts(cls, v: list[int] | None) -> list[int] | None:
+        return normalize_quick_amounts(v)
+
     first_topup_filter: str | None = Field(default=None, pattern='^(any|yes|no)$')
     promo_group_filter_mode: str | None = Field(default=None, pattern='^(all|selected)$')
     allowed_promo_group_ids: list[int] | None = None
     open_url_direct: bool | None = None
+    description: str | None = Field(default=None, description='Null to reset to default')
     # Allow explicitly resetting display_name to null
     reset_display_name: bool = False
+    reset_description: bool = False
     reset_min_amount: bool = False
     reset_max_amount: bool = False
 
@@ -118,67 +115,10 @@ class PromoGroupSimple(BaseModel):
         from_attributes = True
 
 
-class ProviderConfigUpdateRequest(BaseModel):
-    config: dict
-
-
-class ProviderConfigResponse(BaseModel):
-    method_id: str
-    config: dict
-    secret_status: SecretStatus | None = None
-
-
-class SecretUpdateRequest(BaseModel):
-    value: str = Field(min_length=1, max_length=4096)
-
-
 # ============ Helpers ============
 
 
-async def require_payment_secret_permission(
-    request: Request,
-    user: User = Depends(get_current_cabinet_user),
-    db: AsyncSession = Depends(get_cabinet_db),
-) -> User:
-    """Check secret-management permission without persisting the request body."""
-    try:
-        client_ip = get_client_ip(request)
-    except HTTPException:
-        client_ip = 'unknown'
-
-    allowed, reason = await PermissionService.check_permission(
-        db,
-        user,
-        'payment_methods:secrets',
-        ip_address=client_ip,
-    )
-    await PermissionService.log_action(
-        db,
-        user_id=user.id,
-        action='payment_methods:secrets',
-        resource_type='payment_methods',
-        status='success' if allowed else 'denied',
-        ip_address=client_ip,
-        user_agent=request.headers.get('user-agent', ''),
-        request_method=request.method,
-        request_path=str(request.url.path),
-        details={
-            'method': request.method,
-            'path': str(request.url.path),
-            'sensitive_body_redacted': True,
-            **({} if allowed else {'reason': reason}),
-        },
-    )
-    await db.commit()
-    if not allowed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f'Permission denied: {reason}',
-        )
-    return user
-
-
-def _enrich_config(config, defaults: dict, provider_configured: bool | None = None) -> PaymentMethodConfigResponse:
+def _enrich_config(config, defaults: dict) -> PaymentMethodConfigResponse:
     """Enrich a PaymentMethodConfig with env-var defaults."""
     method_def = defaults.get(config.method_id, {})
 
@@ -192,9 +132,11 @@ def _enrich_config(config, defaults: dict, provider_configured: bool | None = No
         sort_order=config.sort_order,
         is_enabled=config.is_enabled,
         display_name=config.display_name,
+        description=config.description,
         default_display_name=method_def.get('default_display_name', config.method_id),
         sub_options=config.sub_options,
         available_sub_options=available_sub_options,
+        quick_amounts=getattr(config, 'quick_amounts', None),
         min_amount_kopeks=config.min_amount_kopeks,
         max_amount_kopeks=config.max_amount_kopeks,
         default_min_amount_kopeks=method_def.get('default_min', 1000),
@@ -204,9 +146,7 @@ def _enrich_config(config, defaults: dict, provider_configured: bool | None = No
         promo_group_filter_mode=config.promo_group_filter_mode,
         allowed_promo_group_ids=[pg.id for pg in config.allowed_promo_groups],
         open_url_direct=bool(getattr(config, 'open_url_direct', False)),
-        is_provider_configured=(
-            provider_configured if provider_configured is not None else method_def.get('is_configured', False)
-        ),
+        is_provider_configured=method_def.get('is_configured', False),
         created_at=config.created_at,
         updated_at=config.updated_at,
     )
@@ -223,11 +163,7 @@ async def list_payment_methods(
     """List all payment method configurations."""
     configs = await get_all_configs(db)
     defaults = _get_method_defaults()
-    result = []
-    for config in configs:
-        configured = await is_provider_configured(db, config.method_id) if config.method_id in CUSTOM_METHODS else None
-        result.append(_enrich_config(config, defaults, configured))
-    return result
+    return [_enrich_config(c, defaults) for c in configs]
 
 
 @router.get('/promo-groups', response_model=list[PromoGroupSimple])
@@ -254,8 +190,7 @@ async def get_payment_method(
             detail=f'Payment method not found: {method_id}',
         )
     defaults = _get_method_defaults()
-    configured = await is_provider_configured(db, method_id) if method_id in CUSTOM_METHODS else None
-    return _enrich_config(config, defaults, configured)
+    return _enrich_config(config, defaults)
 
 
 @router.put('/order')
@@ -289,8 +224,18 @@ async def update_payment_method(
     elif request.display_name is not None:
         data['display_name'] = request.display_name.strip() or None
 
+    if request.reset_description:
+        data['description'] = None
+    elif request.description is not None:
+        data['description'] = request.description.strip() or None
+
     if request.sub_options is not None:
         data['sub_options'] = request.sub_options
+
+    if request.reset_quick_amounts:
+        data['quick_amounts'] = None
+    elif request.quick_amounts is not None:
+        data['quick_amounts'] = request.quick_amounts
 
     if request.reset_min_amount:
         data['min_amount_kopeks'] = None
@@ -316,7 +261,10 @@ async def update_payment_method(
 
     promo_group_ids = request.allowed_promo_group_ids
 
-    config = await update_config(db, method_id, data, promo_group_ids)
+    try:
+        config = await update_config(db, method_id, data, promo_group_ids)
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error))
     if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -326,79 +274,4 @@ async def update_payment_method(
     logger.info('Admin updated payment method config', admin_id=admin.id, method_id=method_id)
 
     defaults = _get_method_defaults()
-    configured = await is_provider_configured(db, method_id) if method_id in CUSTOM_METHODS else None
-    return _enrich_config(config, defaults, configured)
-
-
-@router.get('/{method_id}/provider-config', response_model=ProviderConfigResponse)
-async def get_payment_provider_config(
-    method_id: str,
-    admin: User = Depends(require_permission('payment_methods:read')),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Return provider-specific business settings without plaintext secrets."""
-    if method_id not in CUSTOM_METHODS:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Provider config is not supported')
-    secret_status = (
-        await get_secret_status(db, method_id, YOOMONEY_SECRET_NAME) if method_id == 'yoomoney_donate' else None
-    )
-    return ProviderConfigResponse(
-        method_id=method_id,
-        config=await get_provider_config(db, method_id),
-        secret_status=secret_status,
-    )
-
-
-@router.put('/{method_id}/provider-config', response_model=ProviderConfigResponse)
-async def update_payment_provider_config(
-    method_id: str,
-    request: ProviderConfigUpdateRequest,
-    admin: User = Depends(require_permission('payment_methods:edit')),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Validate and persist provider-specific business settings."""
-    if method_id not in CUSTOM_METHODS:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Provider config is not supported')
-    try:
-        normalized = validate_provider_config(method_id, request.config)
-        saved = await save_provider_config(db, method_id, normalized)
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error))
-    logger.info('Admin updated payment provider config', admin_id=admin.id, method_id=method_id)
-    secret_status = (
-        await get_secret_status(db, method_id, YOOMONEY_SECRET_NAME) if method_id == 'yoomoney_donate' else None
-    )
-    return ProviderConfigResponse(method_id=method_id, config=saved, secret_status=secret_status)
-
-
-@router.put('/{method_id}/secrets/{secret_key}', response_model=SecretStatus)
-async def update_payment_provider_secret(
-    method_id: str,
-    secret_key: str,
-    request: SecretUpdateRequest,
-    admin: User = Depends(require_payment_secret_permission),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Replace a write-only provider secret."""
-    try:
-        result = await set_secret(db, method_id, secret_key, request.value)
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error))
-    logger.info('Admin replaced payment provider secret', admin_id=admin.id, method_id=method_id, secret_key=secret_key)
-    return result
-
-
-@router.delete('/{method_id}/secrets/{secret_key}', response_model=SecretStatus)
-async def clear_payment_provider_secret(
-    method_id: str,
-    secret_key: str,
-    admin: User = Depends(require_payment_secret_permission),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Clear a provider secret without returning its value."""
-    try:
-        result = await delete_secret(db, method_id, secret_key)
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error))
-    logger.info('Admin cleared payment provider secret', admin_id=admin.id, method_id=method_id, secret_key=secret_key)
-    return result
+    return _enrich_config(config, defaults)

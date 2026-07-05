@@ -7,7 +7,6 @@
 !.dockerignore
 !.env.example
 !.gitignore
-!.gitattributes
 !.python-version
 !Dockerfile
 !docker-compose.yml
@@ -25,7 +24,6 @@
 !LICENSE
 !CONTRIBUTING.md
 !SECURITY.md
-!CUSTOMIZATIONS.md
 
 # Скрипты
 !install_bot.sh
@@ -48,9 +46,6 @@
 !assets/**
 !locales/
 !locales/**
-!custom/
-!custom/overlay/
-!custom/overlay/**
 !.github/
 !.github/**
 
