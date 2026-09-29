@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
@@ -14,6 +15,11 @@ from app.services.event_emitter import event_emitter
 logger = structlog.get_logger(__name__)
 
 _USERNAME_RE = re.compile(r'[^A-Za-z0-9_.-]+')
+
+
+def _setting(name: str, default: Any) -> Any:
+    """Read optional legacy MTProto settings without replacing upstream config."""
+    return getattr(settings, name, os.getenv(name, default))
 
 
 class MtprotoServiceError(RuntimeError):
@@ -57,7 +63,7 @@ class MtprotoService:
 
         tls_links = links.get('tls')
         if isinstance(tls_links, list):
-            public_host = settings.MTPROTO_PUBLIC_HOST.strip().lower()
+            public_host = str(_setting('MTPROTO_PUBLIC_HOST', 'cloud.nexus-thread.com')).strip().lower()
             if public_host:
                 matching_link = next(
                     (
@@ -88,6 +94,40 @@ class MtprotoService:
                     return item['link']
 
         return None
+
+    @staticmethod
+    def _build_link_from_secret(user: dict[str, Any]) -> str | None:
+        """Build a FakeTLS Telegram link for the master-control API response.
+
+        The legacy Telemt API returned pre-built links. The master control
+        service intentionally returns the per-user secret instead, so keep
+        both response formats compatible without creating a new proxy user.
+        """
+        secret = user.get('secret')
+        host = str(_setting('MTPROTO_PUBLIC_HOST', 'cloud.nexus-thread.com')).strip().lower()
+        try:
+            port = int(_setting('MTPROTO_PUBLIC_PORT', 2053))
+        except (TypeError, ValueError):
+            return None
+        if (
+            not isinstance(secret, str)
+            or not re.fullmatch(r'[0-9a-fA-F]{32}', secret)
+            or not host
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            return None
+
+        faketls_secret = f"ee{secret.lower()}{host.encode().hex()}"
+        return f"tg://proxy?server={quote(host, safe='.-')}&port={port}&secret={faketls_secret}"
+
+    @staticmethod
+    def _to_https_share_link(link: str) -> str:
+        """Use Telegram's HTTPS proxy deep link for wider client compatibility."""
+        parsed = urlsplit(link)
+        if parsed.scheme == 'tg' and (parsed.netloc or parsed.path) == 'proxy':
+            return f'https://t.me/proxy?{parsed.query}'
+        return link
 
     async def _get_user(self, client: httpx.AsyncClient, username: str) -> dict[str, Any] | None:
         encoded_username = quote(username, safe='')
@@ -124,8 +164,8 @@ class MtprotoService:
     @staticmethod
     def _limits_payload() -> dict[str, int]:
         return {
-            'max_unique_ips': settings.MTPROTO_MAX_UNIQUE_IPS,
-            'max_tcp_conns': settings.MTPROTO_MAX_TCP_CONNS,
+            'max_unique_ips': _setting('MTPROTO_MAX_UNIQUE_IPS', 3),
+            'max_tcp_conns': _setting('MTPROTO_MAX_TCP_CONNS', 50),
         }
 
     @classmethod
@@ -141,7 +181,7 @@ class MtprotoService:
         return patched_user if isinstance(patched_user, dict) else await self._get_user(client, username)
 
     async def ensure_proxy_link(self, telegram_id: int | None, username: str | None) -> str | None:
-        api_url = (settings.MTPROTO_API_URL or '').rstrip('/') + '/'
+        api_url = (str(_setting('MTPROTO_API_URL', '')) or '').rstrip('/') + '/'
         if not api_url or telegram_id is None:
             return None
 
@@ -149,7 +189,9 @@ class MtprotoService:
         created_user = False
 
         try:
-            async with httpx.AsyncClient(base_url=api_url, timeout=self._timeout) as client:
+            api_token = _setting('MTPROTO_API_TOKEN', '')
+            headers = {'Authorization': f'Bearer {api_token}'} if api_token else None
+            async with httpx.AsyncClient(base_url=api_url, timeout=self._timeout, headers=headers) as client:
                 user = await self._get_user(client, desired_username)
                 if user is None:
                     user = await self._find_user_by_telegram_id(client, telegram_id)
@@ -160,7 +202,7 @@ class MtprotoService:
                         json={
                             'username': desired_username,
                             **self._limits_payload(),
-                            'expiration_rfc3339': settings.MTPROTO_EXPIRATION_RFC3339,
+                            'expiration_rfc3339': _setting('MTPROTO_EXPIRATION_RFC3339', '2099-12-31T23:59:59Z'),
                         },
                     )
                     if response.status_code == 409:
@@ -181,9 +223,11 @@ class MtprotoService:
 
                 link = self._find_link(user)
                 if not link:
+                    link = self._build_link_from_secret(user)
+                if not link:
                     raise MtprotoServiceError('Telemt API did not return a proxy link')
 
-                return link
+                return self._to_https_share_link(link)
         except (httpx.HTTPError, ValueError) as error:
             raise MtprotoServiceError('Telemt API request failed') from error
 
